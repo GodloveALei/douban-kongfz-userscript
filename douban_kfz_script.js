@@ -1,7 +1,7 @@
-﻿// ==UserScript==
-// @name         豆瓣 ⇄ 孔夫子互通助手（评分+跳转）
+// ==UserScript==
+// @name         豆瓣读书-孔夫子旧书网互通助手（评分+跳转）
 // @namespace    douban-kongfz-bridge
-// @version      1.1.0
+// @version      1.2.0
 // @description  在孔夫子旧书网详情页显示豆瓣评分与短评；在豆瓣图书详情页添加“一键搜孔网”按钮。按域名分流执行，互不干扰。
 // @author       DRH
 // @match        https://book.kongfz.com/*
@@ -17,26 +17,35 @@
   'use strict';
 
   const host = location.hostname;
-  if (host === 'book.kongfz.com') {
-    initKongfzRating();
-    return;
-  }
-  if (host === 'book.douban.com') {
-    initDoubanSearchButton();
+
+  // 豆瓣侧孔网搜索排序配置：
+  // price: 按价格排序（旧版默认）
+  // quality: 按品相排序（如站点调整，请改下面映射值或直接用 override）
+  const DOUBAN_KFZ_SORT_MODE = 'price'; // 'price' | 'quality'
+  const DOUBAN_KFZ_SORT_TYPE_MAP = { price: '7', quality: '9' };
+  const DOUBAN_KFZ_SORT_TYPE_OVERRIDE = ''; // 例如 '7'；非空时优先生效
+
+  function getDoubanKfzSortType() {
+    if (/^\d+$/.test(DOUBAN_KFZ_SORT_TYPE_OVERRIDE)) return DOUBAN_KFZ_SORT_TYPE_OVERRIDE;
+    return DOUBAN_KFZ_SORT_TYPE_MAP[DOUBAN_KFZ_SORT_MODE] || DOUBAN_KFZ_SORT_TYPE_MAP.price;
   }
 
   function initDoubanSearchButton() {
-    if (!/^\/subject\/\d+\/?$/.test(location.pathname)) return;
+    if (!/\/subject\/\d+/.test(location.pathname)) return;
 
     const BTN_ID = 'kfz-search-btn';
     waitForElement('#info', { timeoutMs: 10000, intervalMs: 200 })
       .then((info) => {
         if (document.getElementById(BTN_ID)) return;
 
-        const isbn = extractIsbnFromInfo(info);
-        if (!isbn) return;
+        const isbn = extractIsbnFromInfo(info) || extractIsbnFromText(document.body?.innerText || '');
+        if (!isbn) {
+          console.warn('[douban-kongfz-userscript] Douban page has no detectable ISBN:', location.href);
+          return;
+        }
 
-        const searchUrl = `https://search.kongfz.com/product/?keyword=${encodeURIComponent(isbn)}&page=1&sortType=7&actionPath=sortType`;
+        const sortType = getDoubanKfzSortType();
+        const searchUrl = `https://search.kongfz.com/product/?keyword=${encodeURIComponent(isbn)}&page=1&sortType=${encodeURIComponent(sortType)}&actionPath=sortType`;
         const recommendBtn = findRecommendButton();
         const container = recommendBtn ? recommendBtn.parentElement : document.querySelector('#interest_sectl, #info');
         if (!container) return;
@@ -53,7 +62,10 @@
 
         link.addEventListener('click', (e) => {
           e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation?.();
           window.open(searchUrl, '_blank', 'noopener');
+          return false;
         });
 
         if (recommendBtn) {
@@ -62,7 +74,9 @@
           container.appendChild(link);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('[douban-kongfz-userscript] Douban button inject failed:', err);
+      });
   }
 
   function waitForElement(selector, options) {
@@ -150,6 +164,12 @@
     return '';
   }
 
+  function extractIsbnFromText(text) {
+    const m = (text || '').match(/ISBN\s*[:：]?\s*([0-9Xx\-]+)/i);
+    if (!m) return '';
+    return m[1].replace(/[^0-9Xx]/g, '');
+  }
+
   function findRecommendButton() {
     const candidates = Array.from(document.querySelectorAll('a, button'));
     return candidates.find((el) => el.textContent && el.textContent.trim() === '推荐') || null;
@@ -158,10 +178,10 @@
   function initKongfzRating() {
     if (typeof GM_xmlhttpRequest !== 'function') return;
 
-    const WAIT_ISBN_MS = 120;
+    const WAIT_ISBN_MS = 320;
     const ISBN_POLL_MS = 60;
     const ISBN_RESOLVE_CAP_MS = 700;
-    const ENABLE_BODY_ISBN_FALLBACK = false;
+    const ENABLE_BODY_ISBN_FALLBACK = true;
     const HTTP_TIMEOUT = 2800;
     const MAX_COMMENTS = 5;
     const MAX_LEN = 85;
@@ -172,7 +192,7 @@
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const toAscii = (s) => (s || '').replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/[－—–‐]/g, '-');
-    const isDetail = (u = location) => u.hostname === 'book.kongfz.com' && /^\/\d{3,}\/\d{6,}\/?$/.test(u.pathname);
+    const isDetail = (u = location) => u.hostname === 'book.kongfz.com' && /^\/\d+\/\d+\/?$/.test(u.pathname);
 
     function http(url, headers = {}, timeout = HTTP_TIMEOUT) {
       return new Promise((res, rej) => {
@@ -316,7 +336,11 @@
     };
 
     function scanISBNInBlocks() {
-      const blocks = ['.detail-info', '.bookinfo', '.product-params', '.spu-params', '.tab_con', '#bookDesc']
+      const blocks = [
+        '.detail-info', '.bookinfo', '.product-params', '.spu-params', '.tab_con', '#bookDesc',
+        '.detail-right', '.book-detail', '.book-details', '.book-params', '.base-info',
+        '.goods-detail', '.goods-info', '.item-detail'
+      ]
         .map((s) => document.querySelector(s)).filter(Boolean);
       for (const el of blocks) {
         const x = pickISBNFromText(el.innerText || '');
@@ -618,5 +642,14 @@
     window.addEventListener('popstate', onURL);
     window.addEventListener('hashchange', onURL);
     onURL();
+  }
+  try {
+    if (host === 'book.kongfz.com') {
+      initKongfzRating();
+    } else if (host === 'book.douban.com') {
+      initDoubanSearchButton();
+    }
+  } catch (err) {
+    console.error('[douban-kongfz-userscript] init failed:', err);
   }
 })();
