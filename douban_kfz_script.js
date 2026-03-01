@@ -1,10 +1,12 @@
 // ==UserScript==
-// @name         豆瓣读书-孔夫子旧书网互通助手（评分+跳转）
+// @name         豆瓣读书-孔夫子旧书网/京东/当当互通助手（评分+跳转）
 // @namespace    douban-kongfz-bridge
-// @version      1.2.0
-// @description  在孔夫子旧书网详情页显示豆瓣评分与短评；在豆瓣图书详情页添加“一键搜孔网”按钮。按域名分流执行，互不干扰。
+// @version      1.3.0
+// @description  在孔网/京东/当当图书详情页显示豆瓣评分与短评；在豆瓣图书详情页添加“一键搜孔网”按钮。按域名分流执行，互不干扰。
 // @author       DRH
 // @match        https://book.kongfz.com/*
+// @match        https://item.jd.com/*
+// @match        https://product.dangdang.com/*
 // @match        https://book.douban.com/subject/*
 // @match        http://book.douban.com/subject/*
 // @grant        GM_xmlhttpRequest
@@ -17,6 +19,7 @@
   'use strict';
 
   const host = location.hostname;
+  const BOOK_OVERLAY_HOSTS = new Set(['book.kongfz.com', 'item.jd.com', 'product.dangdang.com']);
 
   // 豆瓣侧孔网搜索排序配置：
   // price: 按价格排序（旧版默认）
@@ -175,10 +178,35 @@
     return candidates.find((el) => el.textContent && el.textContent.trim() === '推荐') || null;
   }
 
-  function initKongfzRating() {
+  function initBookRatingOverlay() {
     if (typeof GM_xmlhttpRequest !== 'function') return;
 
-    const WAIT_ISBN_MS = 320;
+    const hostRule = {
+      'book.kongfz.com': {
+        waitIsbnMs: 320,
+        needsISBNOnly: false,
+        detailPath: /^\/\d+\/\d+\/?$/,
+        isbnBlockSelectors: [],
+        titleSelectors: ['.bookName', '.detail-right h1']
+      },
+      'item.jd.com': {
+        waitIsbnMs: 1800,
+        needsISBNOnly: true,
+        detailPath: /^\/\d+\.html$/,
+        isbnBlockSelectors: ['.p-parameter', '#parameter2', '.parameter2', '#detail .tab-con', '.book-detail'],
+        titleSelectors: ['.sku-name', '.itemInfo-wrap .sku-name', '.p-name h1']
+      },
+      'product.dangdang.com': {
+        waitIsbnMs: 1800,
+        needsISBNOnly: true,
+        detailPath: /^\/\d+\.html$/,
+        isbnBlockSelectors: ['.messbox_info', '#detail_describe', '.product_main', '.product_detail', '.show_info'],
+        titleSelectors: ['.name_info h1', '.head_title_name', '.product_main h1', '.name_info']
+      }
+    }[host];
+    if (!hostRule) return;
+
+    const WAIT_ISBN_MS = hostRule.waitIsbnMs;
     const ISBN_POLL_MS = 60;
     const ISBN_RESOLVE_CAP_MS = 700;
     const ENABLE_BODY_ISBN_FALLBACK = true;
@@ -191,8 +219,20 @@
     const COLLAPSED_BOX_WIDTH = '228px';
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const isKongfz = host === 'book.kongfz.com';
+    const needsISBNOnly = hostRule.needsISBNOnly;
     const toAscii = (s) => (s || '').replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/[－—–‐]/g, '-');
-    const isDetail = (u = location) => u.hostname === 'book.kongfz.com' && /^\/\d+\/\d+\/?$/.test(u.pathname);
+    const isDetail = (u = location) => u.hostname === host && hostRule.detailPath.test(u.pathname);
+    const COMMON_ISBN_BLOCK_SELECTORS = [
+      '.detail-info', '.bookinfo', '.product-params', '.spu-params', '.tab_con', '#bookDesc',
+      '.detail-right', '.book-detail', '.book-details', '.book-params', '.base-info',
+      '.goods-detail', '.goods-info', '.item-detail'
+    ];
+    const ISBN_BLOCK_SELECTORS = COMMON_ISBN_BLOCK_SELECTORS.concat(hostRule.isbnBlockSelectors);
+    const TITLE_SELECTORS = [
+      'h1', 'h2', '.book-title', '.product-title', '.detail-right .title', '.product-name',
+      ...hostRule.titleSelectors, 'title'
+    ];
 
     function http(url, headers = {}, timeout = HTTP_TIMEOUT) {
       return new Promise((res, rej) => {
@@ -328,20 +368,38 @@
       ensureUI().querySelector('#db-found').textContent = `识别到：${isbn ? `ISBN ${isbn}` : '(无ISBN)'}${title ? `；书名「${title}」` : ''}`;
     };
 
-    const ISBN_RE = /\b(?:ISBN[:\uFF1A]?\s*)?(97[89][-\s]?\d{1,5}[-\s]?\d{1,7}[-\s]?\d{1,7}[-\s]?\d|\d{9}[\dXx])\b/;
+    const ISBN_LABEL_RE = /ISBN(?:-1[03])?\s*[:\uFF1A]?\s*([0-9Xx][0-9Xx\-\s]{8,22})/i;
+    const ISBN13_RE = /\b97[89][-\s]?\d{1,5}[-\s]?\d{1,7}[-\s]?\d{1,7}[-\s]?\d\b/;
+    const ISBN10_RE = /\b\d{9}[\dXx]\b/;
     const normISBN = (v) => v ? v.replace(/[-\s]/g, '').toUpperCase() : null;
+    const isValidISBN = (v) => /^97[89]\d{10}$/.test(v || '') || /^\d{9}[\dX]$/.test(v || '');
     const pickISBNFromText = (txt) => {
-      const m = toAscii(txt || '').match(ISBN_RE);
-      return m ? normISBN(m[1]) : null;
+      const raw = toAscii(txt || '');
+
+      const labeled = raw.match(ISBN_LABEL_RE);
+      if (labeled) {
+        const v = normISBN(labeled[1]);
+        if (isValidISBN(v)) return v;
+      }
+
+      const m13 = raw.match(ISBN13_RE);
+      if (m13) {
+        const v = normISBN(m13[0]);
+        if (isValidISBN(v)) return v;
+      }
+
+      if (isKongfz) {
+        const m10 = raw.match(ISBN10_RE);
+        if (m10) {
+          const v = normISBN(m10[0]);
+          if (isValidISBN(v)) return v;
+        }
+      }
+      return null;
     };
 
     function scanISBNInBlocks() {
-      const blocks = [
-        '.detail-info', '.bookinfo', '.product-params', '.spu-params', '.tab_con', '#bookDesc',
-        '.detail-right', '.book-detail', '.book-details', '.book-params', '.base-info',
-        '.goods-detail', '.goods-info', '.item-detail'
-      ]
-        .map((s) => document.querySelector(s)).filter(Boolean);
+      const blocks = ISBN_BLOCK_SELECTORS.map((s) => document.querySelector(s)).filter(Boolean);
       for (const el of blocks) {
         const x = pickISBNFromText(el.innerText || '');
         if (x) return x;
@@ -351,6 +409,18 @@
 
     function scanISBNInBody() {
       return pickISBNFromText(document.body?.innerText || '');
+    }
+
+    function scanISBNInMeta() {
+      const metas = Array.from(document.querySelectorAll(
+        'meta[name="keywords"], meta[name="description"], meta[property="og:title"], meta[property="og:description"]'
+      ));
+      for (const m of metas) {
+        const content = m.getAttribute('content') || '';
+        const x = pickISBNFromText(content);
+        if (x) return x;
+      }
+      return null;
     }
 
     const cleanTitle = (raw) => {
@@ -365,7 +435,7 @@
     };
 
     function findTitle() {
-      for (const s of ['h1', 'h2', '.book-title', '.product-title', '.detail-right .title', '.product-name', 'title']) {
+      for (const s of TITLE_SELECTORS) {
         const el = document.querySelector(s);
         if (!el) continue;
         const t = cleanTitle(el.innerText || el.textContent || '');
@@ -576,16 +646,17 @@
       lk.innerHTML = '';
       updateMini(box);
 
-      let isbn = scanISBNInBlocks();
+      const scanISBNFast = () => scanISBNInBlocks() || scanISBNInMeta();
+      let isbn = scanISBNFast();
       const title = findTitle();
       setFound(isbn, title);
 
       const end = Date.now() + WAIT_ISBN_MS;
       while (!isbn && Date.now() < end) {
         await sleep(ISBN_POLL_MS);
-        isbn = scanISBNInBlocks();
+        isbn = scanISBNFast();
       }
-      if (!isbn && ENABLE_BODY_ISBN_FALLBACK) isbn = scanISBNInBody();
+      if (!isbn && ENABLE_BODY_ISBN_FALLBACK) isbn = scanISBNInBody() || scanISBNFast();
       setFound(isbn, title);
 
       if (isbn) {
@@ -599,6 +670,12 @@
           return;
         }
         await renderBySID(sid, { st, sc, mt, cm, lk }, alive);
+        return;
+      }
+
+      if (needsISBNOnly) {
+        st.textContent = '未检测到ISBN（当前仅在识别到ISBN时显示评分）';
+        updateMini(box);
         return;
       }
 
@@ -644,8 +721,8 @@
     onURL();
   }
   try {
-    if (host === 'book.kongfz.com') {
-      initKongfzRating();
+    if (BOOK_OVERLAY_HOSTS.has(host)) {
+      initBookRatingOverlay();
     } else if (host === 'book.douban.com') {
       initDoubanSearchButton();
     }
